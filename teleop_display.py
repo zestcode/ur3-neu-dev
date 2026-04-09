@@ -139,12 +139,14 @@ class GripperController:
     def _send(self, command_name):
         hex_str = COMMANDS.get(command_name)
         if hex_str is None:
+            print(f"[Gripper] Unknown command: {command_name}")
             return
         data = bytes.fromhex(hex_str.replace(" ", ""))
         with self._lock:
             self.ser.write(data)
+            self.ser.flush()
         time.sleep(self.command_delay)
-        print(f"Gripper: {command_name}")
+        print(f"[Gripper] Sent: {command_name}")
 
     def send_async(self, command_name):
         if self._worker is not None and self._worker.is_alive():
@@ -214,17 +216,25 @@ def _robot_control_loop(stop_event: Event) -> None:
                 tcp_vel_f = [0 if abs(v) < 0.01 else v for v in tcp_vel]
                 print("TCP vel:", tcp_vel_f)
 
-                if gripper is not None:
-                    btn0 = sm.is_button_pressed(0)
-                    if btn0 and not prev_btn[0]:
-                        gripper.send_async("clamp_min")
-                    prev_btn[0] = btn0
+                btn0 = sm.is_button_pressed(0)
+                btn1 = sm.is_button_pressed(1)
 
-                    btn1 = sm.is_button_pressed(1)
-                    if btn1 and not prev_btn[1]:
+                if btn0 and not prev_btn[0]:
+                    print("[Control] Button 0 pressed (close)")
+                    if gripper is not None:
+                        gripper.send_async("clamp_min")
+                    else:
+                        print("[Control] WARNING: gripper not connected, skipping command")
+                prev_btn[0] = btn0
+
+                if btn1 and not prev_btn[1]:
+                    print("[Control] Button 1 pressed (open)")
+                    if gripper is not None:
                         gripper._send("release_block")  # blocking: freezes TCP during release
                         gripper.send_async("clamp_max")
-                    prev_btn[1] = btn1
+                    else:
+                        print("[Control] WARNING: gripper not connected, skipping command")
+                prev_btn[1] = btn1
 
                 time.sleep(1 / 100)
             else:
@@ -267,9 +277,10 @@ class CameraThread(Thread):
     def run(self):
         caps = []
         for cfg in self._configs:
-            cap = cv2.VideoCapture(cfg["index"])
+            cap = cv2.VideoCapture(cfg["index"], cv2.CAP_V4L2)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  cfg["width"])
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg["height"])
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep only the latest frame in buffer
             if not cap.isOpened():
                 print(f"[Camera] Cannot open camera {cfg['index']}, skipping.")
                 continue
@@ -282,15 +293,23 @@ class CameraThread(Thread):
 
         try:
             while not self._stop.is_set():
+                # Grab from all cameras before decoding any — minimises inter-camera delay
+                grabbed = [cap.grab() for _, cap in caps]
+
                 frames = []
-                for i, (idx, cap) in enumerate(caps):
-                    ret, frame = cap.read()
+                for i, ((idx, cap), ok) in enumerate(zip(caps, grabbed)):
+                    if not ok:
+                        continue
+                    ret, frame = cap.retrieve()
                     if ret:
                         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         cv2.putText(frame, f"cam{i} ({idx})", (10, 25),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                         frames.append(frame)
                 if frames:
+                    target_w = self._configs[0]["width"]
+                    target_h = self._configs[0]["height"]
+                    frames = [cv2.resize(f, (target_w, target_h)) for f in frames]
                     combined = np.hstack(frames) if len(frames) > 1 else frames[0]
                     with self._lock:
                         self._frame = combined

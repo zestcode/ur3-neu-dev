@@ -37,6 +37,7 @@ def update_frame():
             frames.append(frame)
 
     if frames:
+        frames = [cv2.resize(f, (FRAME_WIDTH, FRAME_HEIGHT)) for f in frames]
         combined = np.hstack(frames) if len(frames) > 1 else frames[0]
         img = ImageTk.PhotoImage(Image.fromarray(combined))
         label.imgtk = img

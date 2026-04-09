@@ -7,23 +7,35 @@ Threads
 - CameraThread×2  : Each thread captures one OpenCV camera via lerobot OpenCVCamera
                     and writes frames to an MP4.
 
-Output (per run)
+Output (per run) — LeRobot v2.1 format (readable by openpi 0.5)
 ----------------
   recordings/<timestamp>/
-    cam0.mp4         — base camera, RGB 224×224
-    cam1.mp4         — wrist camera, RGB 224×224
-                       (stored as standard BGR mp4; convert BGR→RGB when reading)
-    robot_log.npz    — timestep-aligned arrays (openpi UR5 field names):
-                          t          : float64 (N,)   seconds since episode start
-                          joints     : float32 (N,6)  actual joint angles rad  ← observation.state[:6]
-                          gripper    : float32 (N,1)  0.0=open 1.0=closed      ← observation.state[6]
-                          actions    : float32 (N,7)  joints+gripper at each step
-                                       (openpi DeltaActions computes q[t+1]-q[t] at training time)
+    data/chunk-000/episode_000000.parquet
+      columns:
+        observation.state  float32 (N, 7)  joints(6 rad) + gripper(0=open/1=closed)
+        action             float32 (N, 7)  same layout; openpi computes delta at train time
+        timestamp          float32 (N,)    seconds since episode start
+        episode_index      int64   (N,)    always 0 per recording
+        frame_index        int64   (N,)    0 … N-1
+        index              int64   (N,)    0 … N-1 (global; single-episode dataset)
+        next.done          bool    (N,)    True only on last frame
+        task_index         int64   (N,)    always 0; see meta/tasks.jsonl
+    videos/chunk-000/
+      observation.images.cam_high/episode_000000.mp4   — base camera,  RGB 224×224
+      observation.images.cam_wrist/episode_000000.mp4  — wrist camera, RGB 224×224
+    meta/
+      info.json              — dataset schema (codebase_version, fps, data_path, video_path, features)
+      episodes.jsonl         — one line: {episode_index, task_index, length}
+      tasks.jsonl            — one line: {task_index, task}
+      episodes_stats.jsonl   — per-episode mean/std/min/max/count for lerobot v2.1 + openpi
+
+  Robot data is recorded at ~100 Hz then downsampled to LEROBOT_FPS (30) by
+  nearest-neighbour lookup on timestamps to align one parquet row per video frame.
 
 Usage
 -----
     conda activate spacemouse-ur
-    pip install lerobot pyserial
+    pip install lerobot pyserial pyarrow
     python3 teleop_vision_record.py
 
 Stop with Ctrl+C — triggers graceful shutdown of all threads.
@@ -37,6 +49,9 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+import json
 import serial
 import time
 import cv2
@@ -64,6 +79,14 @@ CAMERA_CONFIGS = [
     dict(index=2, fps=30, width=640, height=480),
 ]
 OPENPI_IMAGE_SIZE = (224, 224)  # (width, height) required by openpi
+
+# LeRobot v2.1 dataset settings (must be compatible with openpi 0.5)
+LEROBOT_FPS = 30   # must match CAMERA_CONFIGS fps
+LEROBOT_CAM_NAMES = [
+    "observation.images.cam_high",   # cam0 — base/overhead camera
+    "observation.images.cam_wrist",  # cam1 — wrist camera
+]
+TASK_INSTRUCTION = "robot teleoperation"
 
 COMMANDS = {
     "clamp_min":    "01 FB 00 01 F4 00 00 2A 94 01 00 6B",
@@ -241,6 +264,7 @@ class CameraRecorderThread(Thread):
                         frame = cam.async_read(timeout_ms=200)  # (H, W, 3) RGB, native res
                     except TimeoutError:
                         continue  # no new frame yet, keep looping
+                    frame = cv2.resize(frame, (self.width, self.height))  # normalize to configured resolution
                     # Resize to openpi input size, then convert RGB→BGR for VideoWriter
                     frame = cv2.resize(frame, OPENPI_IMAGE_SIZE)
                     writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
@@ -257,6 +281,152 @@ class CameraRecorderThread(Thread):
 # Main
 # ---------------------------------------------------------------------------
 
+def save_lerobot_episode(
+    out_dir: Path,
+    log_t: list,
+    log_joints: list,
+    log_gripper: list,
+    log_actions: list,
+    episode_index: int = 0,
+    task_index: int = 0,
+):
+    """
+    Convert raw recording buffers to LeRobot v2.1 dataset format.
+
+    Robot data (~100 Hz) is downsampled to LEROBOT_FPS by nearest-neighbour
+    lookup on timestamps so that each parquet row aligns with one video frame.
+    Videos were already written to the correct LeRobot paths by CameraRecorderThread.
+    """
+    chunk  = "chunk-000"
+    ep_str = f"episode_{episode_index:06d}"
+
+    # ---- Determine frame count from reference video ----------------------
+    ref_vid = out_dir / "videos" / chunk / LEROBOT_CAM_NAMES[0] / f"{ep_str}.mp4"
+    cap = cv2.VideoCapture(str(ref_vid))
+    N_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+
+    if N_frames == 0:
+        print("Warning: reference video has 0 frames — LeRobot dataset not saved.")
+        return
+
+    # ---- Downsample robot data to camera fps ----------------------------
+    t_arr       = np.array(log_t,       dtype=np.float64)
+    joints_arr  = np.array(log_joints,  dtype=np.float32)
+    gripper_arr = np.array(log_gripper, dtype=np.float32)
+    actions_arr = np.array(log_actions, dtype=np.float32)
+
+    # Target timestamps at LEROBOT_FPS, clipped to recorded robot duration
+    target_t = np.arange(N_frames, dtype=np.float64) / LEROBOT_FPS
+    valid    = target_t <= t_arr[-1]
+    target_t = target_t[valid]
+    N_frames = len(target_t)
+
+    # Nearest-neighbour lookup: one robot-log row per camera frame
+    idx        = np.clip(np.searchsorted(t_arr, target_t, side="left"), 0, len(t_arr) - 1)
+    joints_ds  = joints_arr[idx]             # (N_frames, 6)
+    gripper_ds = gripper_arr[idx]            # (N_frames,)
+    actions_ds = actions_arr[idx]            # (N_frames, 7)
+
+    # observation.state = joints(6) + gripper(1)
+    obs_state = np.concatenate([joints_ds, gripper_ds[:, None]], axis=1).astype(np.float32)
+
+    # ---- Write parquet ---------------------------------------------------
+    data_dir = out_dir / "data" / chunk
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    next_done              = np.zeros(N_frames, dtype=bool)
+    next_done[-1]          = True
+    episode_indices        = np.full(N_frames, episode_index, dtype=np.int64)
+    frame_indices          = np.arange(N_frames, dtype=np.int64)
+    global_indices         = np.arange(N_frames, dtype=np.int64)
+    task_indices           = np.full(N_frames, task_index, dtype=np.int64)
+
+    table = pa.table({
+        "observation.state": pa.array(obs_state.tolist(),  type=pa.list_(pa.float32())),
+        "action":            pa.array(actions_ds.tolist(), type=pa.list_(pa.float32())),
+        "timestamp":         pa.array(target_t.astype(np.float32), type=pa.float32()),
+        "episode_index":     pa.array(episode_indices, type=pa.int64()),
+        "frame_index":       pa.array(frame_indices,   type=pa.int64()),
+        "index":             pa.array(global_indices,  type=pa.int64()),
+        "next.done":         pa.array(next_done,       type=pa.bool_()),
+        "task_index":        pa.array(task_indices,    type=pa.int64()),
+    })
+    parquet_path = data_dir / f"{ep_str}.parquet"
+    pq.write_table(table, parquet_path)
+
+    # ---- Write metadata --------------------------------------------------
+    meta_dir = out_dir / "meta"
+    meta_dir.mkdir(exist_ok=True)
+
+    joint_names = ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "gripper"]
+    features: dict = {
+        "observation.state": {"dtype": "float32", "shape": [7], "names": joint_names},
+        "action":            {"dtype": "float32", "shape": [7], "names": joint_names},
+        "timestamp":         {"dtype": "float32", "shape": [1]},
+        "episode_index":     {"dtype": "int64",   "shape": [1]},
+        "frame_index":       {"dtype": "int64",   "shape": [1]},
+        "index":             {"dtype": "int64",   "shape": [1]},
+        "next.done":         {"dtype": "bool",    "shape": [1]},
+        "task_index":        {"dtype": "int64",   "shape": [1]},
+    }
+    h, w = OPENPI_IMAGE_SIZE[1], OPENPI_IMAGE_SIZE[0]
+    for cam_name in LEROBOT_CAM_NAMES:
+        features[cam_name] = {
+            "dtype": "video",
+            "shape": [h, w, 3],
+            "video_info": {
+                "video.fps": float(LEROBOT_FPS),
+                "video.codec": "mp4v",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": False,
+                "has_audio": False,
+            },
+        }
+
+    info = {
+        "codebase_version": "v2.1",
+        "fps": LEROBOT_FPS,
+        "robot_type": "ur3",
+        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "total_episodes": 1,
+        "total_frames": N_frames,
+        "total_tasks": 1,
+        "total_chunks": 1,
+        "chunks_size": 1000,
+        "features": features,
+    }
+    (meta_dir / "info.json").write_text(json.dumps(info, indent=2))
+    (meta_dir / "episodes.jsonl").write_text(
+        json.dumps({"episode_index": episode_index, "task_index": task_index, "length": N_frames}) + "\n"
+    )
+    (meta_dir / "tasks.jsonl").write_text(
+        json.dumps({"task_index": task_index, "task": TASK_INSTRUCTION}) + "\n"
+    )
+
+    # episodes_stats.jsonl — per-episode statistics required by lerobot v2.1.
+    # Each entry: {"episode_index": int, "stats": {feature: {mean, std, min, max, count}}}
+    # "count" must be a length-1 list (scalar frame count) as required by aggregate_stats().
+    ep_stats: dict = {}
+    for key, arr in [("observation.state", obs_state), ("action", actions_ds)]:
+        ep_stats[key] = {
+            "mean":  arr.mean(axis=0).tolist(),
+            "std":   (arr.std(axis=0) + 1e-8).tolist(),  # epsilon avoids /0 for constant axes
+            "min":   arr.min(axis=0).tolist(),
+            "max":   arr.max(axis=0).tolist(),
+            "count": [N_frames],  # shape (1,) — total frames in this episode
+        }
+    (meta_dir / "episodes_stats.jsonl").write_text(
+        json.dumps({"episode_index": episode_index, "stats": ep_stats}) + "\n"
+    )
+
+    print(f"LeRobot v2.1 dataset saved → {out_dir.resolve()}  ({N_frames} frames @ {LEROBOT_FPS}fps)")
+    print(f"  parquet : {parquet_path}")
+    for cam_name in LEROBOT_CAM_NAMES:
+        print(f"  video   : {out_dir / 'videos' / chunk / cam_name / f'{ep_str}.mp4'}")
+
+
 def main():
     # ---- output directory ------------------------------------------------
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -267,12 +437,16 @@ def main():
     # ---- shared stop event -----------------------------------------------
     stop_event = Event()
 
-    # ---- camera threads --------------------------------------------------
+    # ---- camera threads — write directly to LeRobot v2.1 video paths ----
+    chunk  = "chunk-000"
+    ep_str = "episode_000000"
     cam_threads: list[CameraRecorderThread] = []
-    for i, cfg in enumerate(CAMERA_CONFIGS):
+    for cfg, cam_name in zip(CAMERA_CONFIGS, LEROBOT_CAM_NAMES):
+        vid_dir = out_dir / "videos" / chunk / cam_name
+        vid_dir.mkdir(parents=True, exist_ok=True)
         t = CameraRecorderThread(
             cam_index=cfg["index"],
-            output_path=out_dir / f"cam{i}.mp4",
+            output_path=vid_dir / f"{ep_str}.mp4",
             fps=cfg["fps"],
             width=cfg["width"],
             height=cfg["height"],
@@ -366,17 +540,9 @@ def main():
             if t.error:
                 print(f"[{t.name}] finished with error: {t.error}")
 
-        # ---- save robot log ----------------------------------------------
+        # ---- save LeRobot v2.1 dataset -----------------------------------
         if log_t:
-            npz_path = out_dir / "robot_log.npz"
-            np.savez(
-                npz_path,
-                t=np.array(log_t, dtype=np.float64),          # (N,)
-                joints=np.array(log_joints, dtype=np.float32), # (N,6) rad
-                gripper=np.array(log_gripper, dtype=np.float32), # (N,1) 0.0/1.0
-                actions=np.array(log_actions, dtype=np.float32), # (N,7)
-            )
-            print(f"Robot log saved → {npz_path}  ({len(log_t)} timesteps)")
+            save_lerobot_episode(out_dir, log_t, log_joints, log_gripper, log_actions)
         else:
             print("No robot data recorded.")
 
