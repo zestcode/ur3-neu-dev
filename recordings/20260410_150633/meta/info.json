@@ -5,7 +5,7 @@
   "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
   "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
   "total_episodes": 1,
-  "total_frames": 910,
+  "total_frames": 748,
   "total_tasks": 1,
   "total_chunks": 1,
   "chunks_size": 1000,
