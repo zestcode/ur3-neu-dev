@@ -64,7 +64,6 @@ python3 scripts/check_robot.py
 # Move directly to home position [0°, -90°, 90°, -90°, -90°, 0°]
 python3 scripts/init_robot.py
 ```
-
 ## References
 
 - UR RTDE documentation: https://sdurobotics.gitlab.io/ur_rtde/index.html
