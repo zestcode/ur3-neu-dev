@@ -16,11 +16,16 @@ busy_wait, init_keyboard_listener, VideoEncodingManager, cameras factory) to
 get exactly the same frame-synchronisation behaviour as `record.py` without
 modifying any library code.
  
-State (8D, packed into observation.state):
-    tcp_x.pos, tcp_y.pos, tcp_z.pos, tcp_rx.pos, tcp_ry.pos, tcp_rz.pos,
+State (11D, packed into observation.state):
+    tcp_x.pos, tcp_y.pos, tcp_z.pos,
+    tcp_r1x.pos, tcp_r1y.pos, tcp_r1z.pos,
+    tcp_r2x.pos, tcp_r2y.pos, tcp_r2z.pos,
     gripper_left.pos, gripper_right.pos
-  - 6D TCP pose from rtde_receive.getActualTCPPose() in robot base frame.
-    Last three are an axis-angle rotation vector in radians (NOT Euler).
+  - 3D position from rtde_receive.getActualTCPPose() in robot base frame.
+  - 6D continuous rotation (Zhou et al. 2019): first two columns of the
+    rotation matrix, computed from RTDE's axis-angle output via Rodrigues.
+    Continuous and unique for all rotations in SO(3); avoids the θ=π
+    wraparound that plagues axis-angle.
   - 2D mirrored binary gripper: both 0.0 if closed, both 1.0 if open. Sourced
     from the cached commanded state (no RS485 read-back during the loop).
  
@@ -44,6 +49,7 @@ Example:
  
 import logging
 import os
+import shutil
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -81,9 +87,46 @@ logger = logging.getLogger(__name__)
  
  
 # ============================================================================
+# Rotation utilities
+# ============================================================================
+
+
+def axis_angle_to_rotation_6d(axis_angle) -> np.ndarray:
+    """Convert axis-angle vector to 6D continuous rotation (Zhou et al. 2019).
+
+    Returns the first two columns of the rotation matrix, flattened in
+    column-major order: [r1.x, r1.y, r1.z, r2.x, r2.y, r2.z].
+
+    Why 6D: axis-angle has a sign discontinuity at θ=π and quaternions have a
+    q/-q sign ambiguity. The first two columns of a rotation matrix are
+    continuous and unique for every rotation in SO(3); the third column is
+    recoverable as r1 × r2 so no information is lost.
+
+    Reference:
+        Zhou et al. 2019, "On the Continuity of Rotation Representations
+        in Neural Networks", https://arxiv.org/abs/1812.07035
+    """
+    aa = np.asarray(axis_angle, dtype=np.float64)
+    theta = float(np.linalg.norm(aa))
+    if theta < 1e-8:
+        # Identity rotation: first two columns of I_3.
+        return np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float64)
+    axis = aa / theta
+    # Rodrigues' formula
+    K = np.array([
+        [    0.0, -axis[2],  axis[1]],
+        [ axis[2],     0.0, -axis[0]],
+        [-axis[1],  axis[0],     0.0],
+    ])
+    R = np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
+    # Take first two columns; .T then flatten gives column-major layout.
+    return R[:, :2].T.flatten()
+
+
+# ============================================================================
 # Hardware: SpaceMouse (spnav)
 # ============================================================================
- 
+
 # SpaceMouse native -> robot base frame (right-hand, z-up).
 # robot_x = -spnav_z, robot_y = spnav_x, robot_z = spnav_y. Same matrix is
 # applied to translation and angular velocity.
@@ -268,8 +311,15 @@ _UR_MODE_RUNNING = 7
  
 # Hardware-side feature schema. These keys flow through hw_to_dataset_features
 # unchanged and end up in observation.state / action one-to-one.
-TCP_POSE_KEYS = ("tcp_x.pos", "tcp_y.pos", "tcp_z.pos", "tcp_rx.pos", "tcp_ry.pos", "tcp_rz.pos")
+TCP_POS_KEYS = ("tcp_x.pos", "tcp_y.pos", "tcp_z.pos")
+TCP_ROT6D_KEYS = (
+    "tcp_r1x.pos", "tcp_r1y.pos", "tcp_r1z.pos",   # first column of rotation matrix
+    "tcp_r2x.pos", "tcp_r2y.pos", "tcp_r2z.pos",   # second column of rotation matrix
+)
+TCP_POSE_KEYS = TCP_POS_KEYS + TCP_ROT6D_KEYS       # 9-D total: 3 pos + 6 rot
 GRIPPER_OBS_KEYS = ("gripper_left.pos", "gripper_right.pos")
+# Action keeps axis-angle-rate form: angular velocity has no wraparound, no
+# need to switch the action representation. speedL accepts these directly.
 TCP_VEL_KEYS = ("tcp_x.vel", "tcp_y.vel", "tcp_z.vel", "tcp_rx.vel", "tcp_ry.vel", "tcp_rz.vel")
 GRIPPER_ACTION_KEY = "gripper.cmd"
  
@@ -336,6 +386,12 @@ class UR3RecordConfig:
     display_data: bool = False
     play_sounds: bool = True
     resume: bool = False
+
+    # ---- Home pose (used by the inter-episode y/n prompt) -------------------
+    # Joint angles in radians. Default: [0, -π/2, π/2, -π/2, -π/2, 0].
+    home_joint_positions: list[float] = field(default_factory=lambda: list(HOME_JOINT_POSITIONS))
+    home_velocity: float = 0.5         # rad/s for moveJ
+    home_acceleration: float = 0.5     # rad/s^2 for moveJ
  
  
 # ============================================================================
@@ -358,19 +414,29 @@ def build_hw_features(cfg: UR3RecordConfig) -> tuple[dict, dict]:
  
 def read_observation(rtde_r, gripper_state: float, cameras: dict) -> dict:
     """Build the flat observation dict that build_dataset_frame consumes.
- 
+
     Calls are ordered: cached RTDE pose (sub-ms), cached gripper command, then
     each camera in turn (camera latest-wins async_read, ~1-5 ms each).
+
+    Rotation is recorded as 6D continuous representation (Zhou et al. 2019),
+    not raw axis-angle, to avoid the discontinuity at θ=π. RTDE returns
+    axis-angle in pose[3:6]; we convert to 6 numbers (first two columns of
+    the rotation matrix) before logging. The mapping is bijective onto SO(3),
+    so no information is lost.
     """
     pose = rtde_r.getActualTCPPose()
+    rot_6d = axis_angle_to_rotation_6d(pose[3:6])
     obs: dict = {
-        "tcp_x.pos": pose[0],
-        "tcp_y.pos": pose[1],
-        "tcp_z.pos": pose[2],
-        "tcp_rx.pos": pose[3],
-        "tcp_ry.pos": pose[4],
-        "tcp_rz.pos": pose[5],
-        "gripper_left.pos": gripper_state,
+        "tcp_x.pos":   pose[0],
+        "tcp_y.pos":   pose[1],
+        "tcp_z.pos":   pose[2],
+        "tcp_r1x.pos": float(rot_6d[0]),
+        "tcp_r1y.pos": float(rot_6d[1]),
+        "tcp_r1z.pos": float(rot_6d[2]),
+        "tcp_r2x.pos": float(rot_6d[3]),
+        "tcp_r2y.pos": float(rot_6d[4]),
+        "tcp_r2z.pos": float(rot_6d[5]),
+        "gripper_left.pos":  gripper_state,
         "gripper_right.pos": gripper_state,
     }
     for cam_key, cam in cameras.items():
@@ -452,6 +518,146 @@ def send_action(
     return sent
  
  
+# Joint positions (radians) for the canonical home pose. From CLAUDE.md:
+#   [0°, -90°, 90°, -90°, -90°, 0°] — all joints at multiples of 90°.
+# Override per-session via cfg.home_joint_positions in UR3RecordConfig.
+HOME_JOINT_POSITIONS = [
+    0.0,
+    -np.pi / 2,
+    np.pi / 2,
+    -np.pi / 2,
+    -np.pi / 2,
+    0.0,
+]
+
+
+def move_to_home(rtde_c, joints: list[float], velocity: float, acceleration: float) -> None:
+    """Blocking moveJ to the home joint configuration. Returns when motion ends."""
+    logger.info(f"Moving to home joints: {[f'{j:+.3f}' for j in joints]} "
+                f"(v={velocity}, a={acceleration})")
+    ok = rtde_c.moveJ(joints, velocity, acceleration)
+    if not ok:
+        logger.warning("rtde_c.moveJ returned False — motion may have failed.")
+
+
+def prompt_home_or_continue(
+    rtde_c,
+    rtde_r,
+    gripper: GripperController | None,
+    gripper_state: float,
+    cfg,
+) -> float:
+    """Block on stdin until the user answers y/n.
+
+    'y' → moveJ to home AND open the gripper. Returns gripper_state = 1.0.
+    'n' → return immediately, leave arm and gripper as they are.
+
+    Re-prompts on any other input. Skips the home move (with a warning) if
+    the controller isn't in RUNNING mode. Gripper is opened only after a
+    successful home move.
+
+    Returns the (possibly updated) gripper_state — caller MUST pass this
+    back as `initial_gripper_state` to the next phase so the cached state
+    stays in sync with physical reality.
+    """
+    log_say("Move to home? Press y or n.", cfg.play_sounds)
+    while True:
+        try:
+            choice = input("=> Move robot to home position? [y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()  # newline after ^C
+            return gripper_state
+        if choice == "y":
+            if rtde_r.getRobotMode() != _UR_MODE_RUNNING:
+                logger.warning(
+                    f"Robot not in RUNNING mode (got {rtde_r.getRobotMode()}); "
+                    "skipping home move."
+                )
+                return gripper_state
+            move_to_home(
+                rtde_c,
+                cfg.home_joint_positions,
+                cfg.home_velocity,
+                cfg.home_acceleration,
+            )
+            # Open the gripper as part of the canonical reset pose so the
+            # next episode starts cleanly. Update the cached state and let
+            # actuation complete before handing control back to teleop.
+            if gripper is not None:
+                gripper.open_gripper()
+                log_say("Gripper opened", cfg.play_sounds)
+                time.sleep(1.0)
+                gripper_state = 1.0
+            return gripper_state
+        if choice == "n":
+            return gripper_state
+        print("  Please enter 'y' or 'n'.")
+
+
+def cleanup_orphan_staging(dataset_root: Path, committed_episodes: int) -> None:
+    """Find and remove orphan PNG staging directories from interrupted sessions.
+
+    LeRobot's pipeline writes per-frame PNGs to ``<root>/images/<cam>/episode_NNN/``
+    during recording. ``VideoEncodingManager.__exit__`` normally encodes them
+    into MP4 in ``<root>/videos/...`` and deletes the staging dirs. If the
+    process is killed mid-recording (Ctrl+C, crash, power loss), the staging
+    dirs are abandoned and never get cleaned up by subsequent ``--resume``
+    sessions, because LeRobot's built-in cleanup only fires on exception
+    inside the same ``with`` block.
+
+    An "orphan" here is any staging dir whose episode index is >= the count of
+    committed episodes (i.e., never made it to a parquet). We report what we
+    find first, then remove. Removing the parent ``images/`` tree only happens
+    if it ends up with zero PNGs.
+    """
+    images_root = dataset_root / "images"
+    if not images_root.exists():
+        return
+
+    # Discover orphans: episode_NNN dirs whose index >= committed_episodes
+    orphans: list[tuple[Path, int, int]] = []  # (path, ep_index, n_pngs)
+    for cam_dir in sorted(images_root.iterdir()):
+        if not cam_dir.is_dir():
+            continue
+        for ep_dir in sorted(cam_dir.iterdir()):
+            if not ep_dir.is_dir() or not ep_dir.name.startswith("episode_"):
+                continue
+            try:
+                idx = int(ep_dir.name.removeprefix("episode_"))
+            except ValueError:
+                continue
+            if idx >= committed_episodes:
+                n_pngs = sum(1 for _ in ep_dir.glob("*.png"))
+                orphans.append((ep_dir, idx, n_pngs))
+
+    if not orphans:
+        return
+
+    # Report
+    total_pngs = sum(n for _, _, n in orphans)
+    logger.warning(
+        f"Found {len(orphans)} orphan staging dir(s) in {images_root} "
+        f"({total_pngs} PNG frames total). These are leftover from an "
+        f"interrupted prior session and will be removed before recording starts."
+    )
+    for path, idx, n in orphans:
+        logger.warning(
+            f"  orphan: {path.relative_to(dataset_root)}  "
+            f"(episode {idx}, {n} frames)  -> removing"
+        )
+        shutil.rmtree(path)
+
+    # Remove the images/ parent if there are no PNGs anywhere left
+    remaining = list(images_root.rglob("*.png"))
+    if not remaining and images_root.exists():
+        # Also remove any now-empty per-camera subdirs and the images/ root.
+        try:
+            shutil.rmtree(images_root)
+            logger.info(f"  removed empty staging tree: {images_root}")
+        except OSError as e:
+            logger.warning(f"  could not remove {images_root}: {e}")
+
+
 def wait_until_running(rtde_r, timeout_s: float) -> None:
     """Block until UR controller mode is RUNNING (7) or timeout."""
     if timeout_s <= 0:
@@ -511,14 +717,51 @@ def record_loop(
     start_episode_t = time.perf_counter()
     prev_btn = [False, False]
     gripper_state = initial_gripper_state
- 
+
+    # RTDE EOF watchdog. The boost::asio receive socket can drop with
+    #     "RTDEReceiveInterface boost system Exception: (asio.misc:2) End of file"
+    # printed to stdout but NOT raised as a Python exception. After that,
+    # getActualTCPPose() silently returns the last cached value forever and
+    # all subsequent episodes record frozen state. We detect the symptom by
+    # watching getTimestamp() — if it doesn't advance for STUCK_THRESHOLD_S
+    # we abort the whole recording session immediately. The in-progress
+    # episode buffer is cleared so we don't save partially-frozen frames,
+    # and the outer finally block does the safe shutdown (speedStop,
+    # stopScript, close cameras, gripper, sm, etc.).
+    STUCK_THRESHOLD_S = 1.0
+    last_rtde_ts: float | None = None
+    stuck_seconds = 0.0
+
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
- 
+
         if events["exit_early"]:
             events["exit_early"] = False
             break
- 
+
+        # ---- RTDE freshness check (EOF detector) ----
+        cur_ts = rtde_r.getTimestamp()
+        if last_rtde_ts is not None:
+            if cur_ts == last_rtde_ts:
+                stuck_seconds += 1.0 / fps
+                if stuck_seconds > STUCK_THRESHOLD_S:
+                    logger.error(
+                        f"RTDE timestamp stuck at {cur_ts:.4f} for "
+                        f"{stuck_seconds:.2f}s — receive socket likely dropped "
+                        f"(boost::asio EOF). Ending recording session."
+                    )
+                    events["stop_recording"] = True
+                    if dataset is not None:
+                        try:
+                            dataset.clear_episode_buffer()
+                            logger.info("In-progress episode buffer cleared.")
+                        except Exception as e:
+                            logger.warning(f"clear_episode_buffer failed: {e}")
+                    break
+            else:
+                stuck_seconds = 0.0
+        last_rtde_ts = cur_ts
+
         # 1. Observation: cached RTDE pose + cached gripper + cameras
         observation = read_observation(rtde_r, gripper_state, cameras)
         if dataset is not None:
@@ -636,7 +879,20 @@ def record(cfg: UR3RecordConfig) -> LeRobotDataset:
             command_delay=cfg.gripper_command_delay_s,
         )
         gripper.enable()
- 
+        # Force physical gripper to match cfg.initial_gripper_state so frame 0
+        # of the first episode is honest. enable() only powers the motor, it
+        # does NOT move the jaws — without this, whatever physical state the
+        # gripper happened to be in becomes mislabeled until the operator
+        # presses a button. Sleep waits for the actuator to finish moving.
+        time.sleep(0.5)
+        if cfg.initial_gripper_state >= 0.5:
+            gripper.open_gripper()
+            log_say("Gripper opened to match initial state", cfg.play_sounds)
+        else:
+            gripper.close_gripper()
+            log_say("Gripper closed to match initial state", cfg.play_sounds)
+        time.sleep(1.5)
+
     for cam in cameras.values():
         cam.connect()
  
@@ -647,6 +903,11 @@ def record(cfg: UR3RecordConfig) -> LeRobotDataset:
             root=cfg.dataset.root,
             batch_encoding_size=cfg.dataset.video_encoding_batch_size,
         )
+        # Sweep stale PNG staging from any prior interrupted session BEFORE
+        # the new image_writer starts. This prevents new frames from mixing
+        # into directories that hold half-recorded episodes whose parquets
+        # never got committed.
+        cleanup_orphan_staging(dataset.root, dataset.num_episodes)
         if n_cams > 0:
             dataset.start_image_writer(
                 num_processes=cfg.dataset.num_image_writer_processes,
@@ -691,7 +952,18 @@ def record(cfg: UR3RecordConfig) -> LeRobotDataset:
                     dataset=dataset,
                     single_task=cfg.dataset.single_task,
                 )
- 
+
+                # Inter-episode home prompt: blocks on stdin until y/n. Allows
+                # the operator to send the arm back to a canonical pose before
+                # the manual reset phase. On 'y', also opens the gripper and
+                # updates the cached gripper_state so the next phase agrees
+                # with physical reality. The arm is already stopped (record_loop
+                # ends with speedStop), so it's safe to switch to moveJ here.
+                if not events["stop_recording"]:
+                    gripper_state = prompt_home_or_continue(
+                        rtde_c, rtde_r, gripper, gripper_state, cfg
+                    )
+
                 # Reset phase: keep teleop active but drop frames.
                 if not events["stop_recording"] and (
                     (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
